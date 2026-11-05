@@ -1,0 +1,21 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Packed artifacts
+*.tgz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
