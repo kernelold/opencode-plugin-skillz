@@ -38,7 +38,7 @@ function runtime(dataDir: string, directory: string) {
   const skill: Plugin.Context['skill'] = {
     transform: async callback => {
       callbacks.add(callback); apply();
-      return { dispose: async () => { callbacks.delete(callback); disposed++; } };
+      return { dispose: async () => { callbacks.delete(callback); disposed++; apply(); } };
     },
     reload: vi.fn(async () => { if (failReload) { failReload = false; throw new Error('reload failed'); } apply(); }),
     list: async () => ({ location: { directory }, data: visible }),
@@ -65,6 +65,47 @@ function externalSkill(id: string, file: string): Skill.Info {
 }
 
 describe('OpenCode V2 registration', () => {
+  it('disposes only its own transform when a replacement exposes the same skill file', async () => {
+    const dataDir = await temp(); const root = await temp();
+    const original = await file(root, 'six-thinking-hats/SKILL.md');
+    const core = new Skillz({ dataDir }); const source = await core.addSource(root); await core.install(source.id);
+    const host = runtime(dataDir, await temp());
+    const old = new SkillRegistration(host.skill); const replacement = new SkillRegistration(host.skill);
+    await old.replace(await core.listInstalled(), false);
+    await replacement.replace(await core.listInstalled(), false);
+    const list = vi.spyOn(host.skill, 'list');
+    await expect(old.dispose()).resolves.toBeUndefined();
+    await old.dispose(); // Already disposed is also success.
+    expect(list).not.toHaveBeenCalled(); expect(host.skill.reload).not.toHaveBeenCalled();
+    expect(host.registrations).toBe(1); expect(host.visible.map(s => s.path)).toEqual([original]);
+    await replacement.dispose(); expect(host.registrations).toBe(0); expect(host.visible).toEqual([]);
+  });
+  it('accepts an independently discovered same-file fallback without an override record', async () => {
+    const dataDir = await temp(); const root = await temp(); const original = await file(root, 'same/SKILL.md');
+    const core = new Skillz({ dataDir }); const source = await core.addSource(root); await core.install(source.id);
+    const host = runtime(dataDir, await temp()); const registration = new SkillRegistration(host.skill);
+    await registration.replace(await core.listInstalled());
+    host.external.push(externalSkill('same', original));
+    await expect(registration.replace([])).resolves.toBeTypeOf('function');
+    expect(host.registrations).toBe(0); expect(host.visible.map(s => s.path)).toEqual([original]);
+    expect(await stat(original)).toBeDefined();
+  });
+  it('releases skill registrations even when RPC cleanup fails and the skill API is unavailable', async () => {
+    const dataDir = await temp(); const root = await temp(); await file(root, 'one/SKILL.md');
+    const core = new Skillz({ dataDir }); const source = await core.addSource(root); await core.install(source.id);
+    const host = runtime(dataDir, await temp()); const cleanup = await setup(host.ctx);
+    const rpc = await vi.mocked(host.ctx.rpc.register).mock.results[0].value;
+    vi.spyOn(rpc, 'dispose').mockRejectedValue(new Error('RPC already unavailable'));
+    const list = vi.spyOn(host.skill, 'list').mockRejectedValue(new Error('location closed'));
+    vi.mocked(host.skill.reload).mockRejectedValue(new Error('location closed'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(cleanup()).resolves.toBeUndefined();
+      expect(warning).toHaveBeenCalledWith('Skillz RPC cleanup failed', expect.any(Error));
+      expect(host.registrations).toBe(0); expect(host.visible).toEqual([]);
+      expect(list).not.toHaveBeenCalled(); expect(host.skill.reload).not.toHaveBeenCalled();
+    } finally { warning.mockRestore(); }
+  });
   it('keeps abandoned multi-skill entries individually toggleable/removable without affecting sibling or external files', async () => {
     const root = await temp(); const first = await file(root, 'same/SKILL.md'); const second = await file(root, 'other/SKILL.md');
     const fallback = await file(await temp(), '.opencode/skills/same/SKILL.md');

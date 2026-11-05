@@ -40,6 +40,25 @@ export async function setup(ctx: Plugin.Context): Promise<() => Promise<void>> {
   let rpc: { dispose(): Promise<void> } | undefined;
   const controller = new AbortController();
   let stopScheduler: (() => Promise<void>) | undefined;
+  const cleanup = async () => {
+    controller.abort();
+    const attempt = async (name: string, dispose: () => Promise<void> | undefined) => {
+      try { await dispose(); }
+      catch (error) { console.warn(`Skillz ${name} cleanup failed`, error); }
+    };
+    // A pending scheduler cycle may need the store lock itself.
+    await attempt('scheduler', () => stopScheduler?.());
+    const release = async () => {
+      group.delete(member); if (!group.size) locations.delete(key);
+      await attempt('RPC', () => rpc?.dispose());
+      await attempt('registration', () => registration.dispose());
+    };
+    try { await skillz.store.withLock(release); }
+    catch (error) {
+      console.warn('Skillz cleanup lock failed', error);
+      await release();
+    }
+  };
   try {
     await skillz.store.withLock(async () => {
       // Do not call list/reload during setup: filesystem/config skill discovery follows initial transforms.
@@ -86,17 +105,9 @@ export async function setup(ctx: Plugin.Context): Promise<() => Promise<void>> {
       if (!controller.signal.aborted) await skillz.store.reportIssues([{ code: 'registration-error', message: String(error) }]);
     }).catch(() => { /* An unwritable Errors log must not produce an unhandled rejection. */ });
   } catch (error) {
-    group.delete(member); if (!group.size) locations.delete(key);
-    await registration.dispose(); throw error;
+    await cleanup(); throw error;
   }
-  return async () => {
-    controller.abort();
-    await stopScheduler?.();
-    await skillz.store.withLock(async () => {
-      group.delete(member); if (!group.size) locations.delete(key);
-      await rpc?.dispose(); await registration.dispose();
-    });
-  };
+  return cleanup;
 }
 export default Plugin.define({ id: 'skillz', setup });
 
