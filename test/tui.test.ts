@@ -1,0 +1,554 @@
+import { describe, it, expect, vi } from 'vitest';
+import type { Plugin } from '@opencode/plugin/tui';
+import type { DialogSelectOptions } from '@opencode/plugin/tui/context';
+import { SkillzRpc, type SkillzMethods } from '../src/rpc.js';
+import plugin, { setup, createRpc } from '../src/tui/index.js';
+import { SkillzManager, collisionError, confirmNo, withOverride, type ManagerUI } from '../src/tui/controller.js';
+import { tabs, nextTab, tabStrip, rowsFor, filterRows, badges, entryDetails, installedDetails, sourceLocation, text,
+  sourceTrust, installConfirmation, actionTone, badgeTone, checkedHint, updateStatusStale, InstallChecklist, defaultTab, emptyHint, skillValue, type Snapshot, type Available } from '../src/tui/model.js';
+
+vi.mock('../src/tui/render.js', () => ({ createManagerUI: (context: Plugin.Context) => context.ui }));
+
+const source: Available = { id: 'one', name: 'Example kit', source: { type: 'git', url: 'https://example.test/kit.git', ref: 'main', subpath: 'skills' }, options: {},
+  description: 'Example tooling', skills: ['sample', 'audit'], version: 'v1', license: 'MIT', parentId: 'catalog' };
+function snapshot(): Snapshot {
+  return { sources: [{ id: 'catalog', name: 'Example marketplace', source: { type: 'marketplace-url', url: 'https://example.test/marketplace.json' }, options: {}, catalog: true }, source],
+    available: [source], installed: [{ sourceId: 'one', version: 'v1', current: '/cache/one', enabled: true, scope: 'user', overrides: ['sample overrides /external/sample/SKILL.md'],
+      skills: [{ id: 'sample', name: 'Sample', description: 'Sample safely', dir: '/cache/one/sample', skillFile: '/cache/one/sample/SKILL.md' }] }],
+    errors: [{ id: 'error', code: 'unsupported-component', message: 'Commands not supported', created: '2026-11-04T00:00:00Z', sourceId: 'one' }],
+    updates: [{ sourceId: 'one', installedVersion: 'v1', availableVersion: 'v2', updateAvailable: true, issues: [] }] };
+}
+type UI = ManagerUI;
+type SelectOptions = Parameters<UI['dialog']['select']>[0];
+type Step = unknown | ((options: SelectOptions) => unknown);
+function harness(steps: Step[] = [], prompts: (string | undefined)[] = [], skillsTab = false) {
+  const state = snapshot();
+  let checkedAt: string | null = null;
+  const ui: UI = { removalChoice: vi.fn(async () => steps.shift() as 'remove' | 'keep' | undefined), confirmation: vi.fn(async () => steps.shift() === true), dialog: {
+    alert: vi.fn(async () => {}), confirm: vi.fn(async () => false),
+    prompt: vi.fn(async () => prompts.shift()), clear: vi.fn(), set: vi.fn(), show: vi.fn(),
+    select: vi.fn(async <Value>(options: DialogSelectOptions<Value>) => {
+      const step = steps.shift();
+      return (typeof step === 'function' ? step(options) : step) as Value | undefined;
+    }) as UI['dialog']['select'],
+  }, toast: { show: vi.fn() } };
+  const rpc = {
+    listSources: vi.fn(async () => state.sources), listAvailable: vi.fn(async () => state.available), listInstalled: vi.fn(async () => state.installed),
+    listErrors: vi.fn(async () => state.errors), checkUpdates: vi.fn(async () => { checkedAt = new Date().toISOString(); return state.updates; }),
+    listUpdateStatus: vi.fn(async () => ({ checkedAt, updates: state.updates })), clearErrors: vi.fn(async () => {}),
+    refresh: vi.fn(async () => []), addSource: vi.fn(async () => source), removeSource: vi.fn(async () => {}), remove: vi.fn(async () => {}),
+    previewRemoveSource: vi.fn(async () => ({ sourceId: 'catalog', source: state.sources[0], entries: state.installed, skillCount: state.installed.reduce((n, s) => n + s.skills.length, 0), revision: 'preview' })),
+    install: vi.fn(async () => state.installed[0]), update: vi.fn(async () => state.installed[0]), setEnabled: vi.fn(async () => ({ ...state.installed[0], enabled: false })),
+  } satisfies SkillzMethods;
+  const manager = new SkillzManager(rpc, ui);
+  // Older flow tests start in Discover; default-tab behavior is tested separately.
+  if (!skillsTab) Object.assign(manager, { tab: 'Discover' });
+  return { ui, rpc, state, manager };
+}
+function footer(bind: string): (options: SelectOptions) => undefined {
+  return options => {
+    const action = options.actions?.find(a => a.bind === bind);
+    expect(action?.selection).toBe('none');
+    if (action?.selection === 'none') action.onTrigger();
+    return undefined;
+  };
+}
+
+describe('pure TUI model', () => {
+  it('lists individual skills by name with provenance, categories and effective state, excluding removals', () => {
+    const state = snapshot(); const entry = state.installed[0];
+    entry.disabledSkills = ['sample'];
+    entry.skills.push({ ...entry.skills[0], id: 'audit', name: 'Audit', category: 'group-a/security', description: 'Audit changes. More details.' });
+    state.installed.push({ ...entry, sourceId: 'lost', enabled: false, abandoned: true, formerSource: { ...source, name: 'Former kit' },
+      disabledSkills: [], excludedSkills: ['hidden'], skills: [{ ...entry.skills[0], id: 'sample', name: 'Sample' }, { ...entry.skills[0], id: 'hidden' }] });
+    const rows = rowsFor('Skills', state);
+    expect(rows.map(r => r.title)).toEqual(['Audit', 'Sample', 'Sample']);
+    expect(new Set(rows.map(r => r.value)).size).toBe(3);
+    expect(rows[0].description).toBe('Audit changes.');
+    expect(rows[0].footer).toContain('Example kit · one · group-a/security · [enabled] [update available]');
+    expect(filterRows('sample disabled', rows)).toHaveLength(2);
+    expect(filterRows('former abandoned', rows)).toHaveLength(1);
+    expect(filterRows('audit group-a/security changes', rows)).toHaveLength(1);
+    expect(filterRows('nonexistent', rows)).toHaveLength(0);
+    expect(rows.find(r => r.value === skillValue('lost', 'sample'))?.footer).toContain('[disabled] [source disabled] [abandoned]');
+    expect(defaultTab(state)).toBe('Skills'); expect(defaultTab({ ...state, installed: [] })).toBe('Discover');
+    expect(rowsFor('Skills', { ...state, installed: [] })).toEqual([]);
+    expect(emptyHint('Skills')).toContain('Discover'); expect(emptyHint('Skills')).toContain('Sources');
+  });
+  it.each([1, 8, 9])('expands a single category only when the source has at most eight skills (%s)', count => {
+    const checklist = new InstallChecklist({ ...source, skillChoices: Array.from({ length: count }, (_, i) => ({ id: `skill-${i}`, name: `skill-${i}`, category: 'kit', excluded: false })) });
+    expect(checklist.rows()[0].expanded).toBe(count <= 8);
+    expect(checklist.rows()).toHaveLength(count <= 8 ? count + 1 : 1);
+    expect(checklist.selected.size).toBe(count);
+  });
+  it('collapses multiple categories without hiding ungrouped skills or changing exclusions', () => {
+    const checklist = new InstallChecklist({ ...source, skillChoices: [
+      { id: 'root', name: 'root', excluded: false }, { id: 'one', name: 'one', category: 'alpha', excluded: false },
+      { id: 'two', name: 'two', category: 'beta', excluded: true },
+    ] });
+    expect(checklist.rows().map(r => r.title)).toEqual(['root', 'alpha', 'beta']);
+    checklist.expandAll(true); expect(checklist.rows().map(r => r.title)).toEqual(['root', 'alpha', 'one', 'beta', 'two']);
+    checklist.expandAll(false); expect(checklist.rows().map(r => r.title)).toEqual(['root', 'alpha', 'beta']);
+    expect(checklist.exclusions()).toEqual(['beta/']);
+    checklist.toggle(checklist.rows()[1]); expect(checklist.exclusions()).toEqual(['alpha/', 'beta/']);
+    checklist.toggle(checklist.rows()[1]); expect(checklist.selected.has('one')).toBe(true);
+  });
+  it('keeps large flat sources visible regardless of expand/collapse commands', () => {
+    const checklist = new InstallChecklist({ ...source, skills: Array.from({ length: 9 }, (_, i) => `skill-${i}`) });
+    checklist.expandAll(false); expect(checklist.rows()).toHaveLength(9);
+    checklist.expandAll(true); expect(checklist.rows().every(r => !r.header)).toBe(true);
+  });
+  it('uses a ten-minute cache TTL and honest relative check times', () => {
+    const now = Date.parse('2026-11-05T12:00:00Z');
+    expect(updateStatusStale(null, now)).toBe(true);
+    expect(updateStatusStale('invalid', now)).toBe(true);
+    expect(updateStatusStale(new Date(now - 599999).toISOString(), now)).toBe(false);
+    expect(updateStatusStale(new Date(now - 600000).toISOString(), now)).toBe(true);
+    expect(checkedHint(null, now)).toBe('never checked');
+    expect(checkedHint(new Date(now - 10800000).toISOString(), now)).toBe('checked 3h ago');
+    expect(checkedHint(new Date(now - 180000).toISOString(), now)).toBe('checked 3m ago');
+  });
+  it('cycles tabs and formats the active tab without mutating state', () => {
+    expect(tabs).toEqual(['Skills', 'Discover', 'Installed sources', 'Sources', 'Errors']);
+    expect(nextTab('Skills', -1)).toBe('Errors');
+    expect(nextTab('Errors', 1)).toBe('Skills');
+    expect(nextTab('Sources', 9)).toBe('Installed sources');
+    expect(tabStrip('Installed sources')).toBe('Skills · Discover · [Installed sources] · Sources · Errors');
+  });
+  it('searches all displayed metadata with case-insensitive AND matching', () => {
+    const rows = rowsFor('Discover', snapshot());
+    expect(filterRows('MIT example', rows)).toHaveLength(1);
+    expect(filterRows('sample nonexistent', rows)).toHaveLength(0);
+    expect(filterRows('  ', rows)).toEqual(rows);
+    expect(rows[0].category).toBe('Example marketplace');
+  });
+  it('formats git pins, local paths and missing entry metadata honestly', () => {
+    expect(sourceLocation(source)).toBe('https://example.test/kit.git#main (skills)');
+    expect(sourceLocation({ ...source, source: { type: 'local', path: '/my/skills' } })).toBe('/my/skills');
+    expect(entryDetails(source)).toContain('Skills: sample, audit');
+    expect(entryDetails({ ...source, version: undefined, license: undefined, skills: undefined })).toContain('Version: unknown\nLicence: not declared');
+    expect(text('\x1b[31mHello\nthere\x07')).toBe(' [31mHello there ');
+  });
+  it('computes update badges without mistaking failed or missing checks for up to date', () => {
+    const s = snapshot();
+    expect(badges(s.installed[0], s.updates[0])).toEqual(['enabled', 'update available', 'overrides']);
+    expect(badges({ ...s.installed[0], enabled: false }, { ...s.updates[0], issues: [{ code: 'fetch-error', message: 'offline' }] })).toEqual(['disabled', 'update check failed', 'overrides']);
+    expect(badges(s.installed[0])).toContain('update not checked');
+    expect(badges(s.installed[0], { ...s.updates[0], updateAvailable: false })).toContain('up to date');
+  });
+  it('derives source trust from explicit provenance, not individual skills or host similarity', () => {
+    const state = snapshot();
+    expect(sourceTrust(state.sources[0], state.sources)).toEqual({ label: 'Trusted — you added this source', tone: 'success' });
+    expect(sourceTrust(source, state.sources)).toEqual({ label: 'Not added by you — from marketplace Example marketplace', tone: 'warning' });
+    for (const upstream of [
+      { type: 'local', path: '/skills' }, { type: 'md-url', url: 'https://other.test/skill.md' },
+      { type: 'archive-url', url: 'https://other.test/skill.zip', format: 'zip' },
+    ] as const) expect(sourceTrust({ ...source, source: upstream, parentId: undefined }).tone).toBe('success');
+    const withExplicit = [...state.sources, { ...source, id: 'explicit', parentId: undefined }];
+    expect(sourceTrust(source, withExplicit).tone).toBe('success');
+    expect(sourceTrust(source, []).label).toContain('marketplace catalog');
+    expect(sourceTrust(source, withExplicit.filter(s => s.id !== 'explicit')).tone).toBe('warning');
+    expect(sourceTrust(source, [...state.sources, { ...source, parentId: undefined, source: { ...source.source, type: 'git', url: 'https://example.test/kit.git', ref: 'other' } }]).tone).toBe('warning');
+    const child = { ...source, source: { type: 'local' as const, path: '/skills/ a' } };
+    expect(sourceTrust(child, [{ ...child, parentId: undefined, source: { type: 'local', path: '/skills/\na' } }]).tone).toBe('warning');
+  });
+  it('formats a single read-only install preview and semantic action/badge colours', () => {
+    const preview = installConfirmation(source, snapshot().sources);
+    expect(preview.title).toBe('Install skill? · Example kit');
+    expect(preview.message).toContain('Skills: sample, audit (2)');
+    expect(preview.message).toContain('Version: v1    Licence: MIT');
+    expect(preview.message).not.toMatch(/untrusted/i);
+    expect(preview.message).toContain('Nothing is executed during install.');
+    expect(preview.yes).toBe('Yes, install');
+    expect(actionTone('Enable source')).toBe('success');
+    expect(actionTone('Remove source')).toBe('error');
+    expect(actionTone('No')).toBe('error');
+    expect(actionTone('No, cancel')).toBe('error');
+    expect(actionTone('Update source')).toBe('warning');
+    expect(badgeTone('overrides')).toBe('warning');
+    expect(badgeTone('disabled')).toBe('error');
+    expect(badgeTone('update not checked')).toBe('muted');
+  });
+  it('renders sources, skills, override origin, update versions and newest errors', () => {
+    const s = snapshot();
+    expect(rowsFor('Installed sources', s)[0].footer).toContain('[update available]');
+    const details = installedDetails(s.installed[0], source, s.updates[0]);
+    expect(details).toContain('sample — Sample safely');
+    expect(details).toContain('sample overrides /external/sample/SKILL.md');
+    expect(details).toContain('Available version: v2');
+    expect(rowsFor('Sources', s).map(r => r.category)).toEqual(['Marketplaces', 'Marketplace entries']);
+    s.errors.push({ ...s.errors[0], id: 'newer' });
+    expect(rowsFor('Errors', s)[0].value).toBe('newer');
+    expect(s.errors[0].id).toBe('error');
+    expect(tabs.every(t => rowsFor(t, { sources: [], installed: [], available: [], errors: [], updates: [] }).length === 0)).toBe(true);
+  });
+});
+
+describe('explicit override confirmation', () => {
+  const collision = { type: 'collision', message: 'collision', data: { id: 'sample', origin: '/external/SKILL.md', canOverride: true } };
+  it.each([undefined, false])('defaults to No for cancellation/Enter (%s)', async answer => {
+    const h = harness([answer]);
+    const action = vi.fn(async (_approved: boolean): Promise<string> => { throw collision; });
+    expect(await withOverride(h.ui, action)).toBeUndefined();
+    expect(action).toHaveBeenCalledExactlyOnceWith(false);
+    expect(h.ui.confirmation).toHaveBeenCalledWith(expect.objectContaining({ yes: 'Yes, override', message: expect.stringContaining('/external/SKILL.md') }));
+    expect(h.ui.dialog.alert).not.toHaveBeenCalled();
+  });
+  it('retries using confirmOverride=true only on explicit Yes', async () => {
+    const h = harness([true]);
+    const action = vi.fn(async (approved: boolean) => { if (!approved) throw collision; return 'ok'; });
+    expect(await withOverride(h.ui, action)).toBe('ok');
+    expect(action.mock.calls).toEqual([[false], [true]]);
+    expect(h.ui.confirmation).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('any other conflicting skills') }));
+    expect(h.ui.confirmation).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('removing the source restores it') }));
+  });
+  it('never retries non-overridable config skills or generic transport errors', async () => {
+    const h = harness([true]);
+    const action = vi.fn(async () => { throw { ...collision, data: { ...collision.data, canOverride: false } }; });
+    await withOverride(h.ui, action);
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(h.ui.dialog.select).not.toHaveBeenCalled();
+    expect(h.ui.dialog.alert).toHaveBeenCalledWith(expect.objectContaining({ title: 'Cannot override' }));
+    await expect(withOverride(h.ui, async () => { throw new Error('offline'); })).rejects.toThrow('offline');
+    expect(collisionError({ type: 'collision', data: { id: 5 } })).toBeUndefined();
+    expect(collisionError(undefined)).toBeUndefined();
+  });
+  it('does not open a confirmation or retry after plugin cleanup', async () => {
+    const h = harness([true]);
+    let active = true;
+    h.ui.confirmation = vi.fn(async () => { active = false; return true; });
+    expect(await confirmNo(h.ui, 'Continue?', 'Test', () => active)).toBe(false);
+    expect(h.ui.dialog.select).not.toHaveBeenCalled();
+    const action = vi.fn(async () => 'ok');
+    await withOverride(h.ui, action, () => active);
+    expect(action).not.toHaveBeenCalled();
+  });
+});
+
+describe('dialog manager through the RPC interface only', () => {
+  it('defaults to Skills when installed, wraps left to Errors and right back, and defaults to Discover when empty', async () => {
+    const h = harness([footer('left'), footer('right'), undefined], [], true); await h.manager.open();
+    expect(vi.mocked(h.ui.dialog.select).mock.calls.map(([o]) => o.title)).toEqual([
+      'Skillz: [Skills] · Discover · Installed sources · Sources · Errors', 'Skillz: Skills · Discover · Installed sources · Sources · [Errors]',
+      'Skillz: [Skills] · Discover · Installed sources · Sources · Errors',
+    ]);
+    const empty = harness([], [], true); empty.state.installed = []; await empty.manager.open();
+    expect(vi.mocked(empty.ui.dialog.select).mock.calls[0][0].title).toContain('[Discover]');
+    await h.manager.open(); expect(vi.mocked(h.ui.dialog.select).mock.lastCall?.[0].title).toContain('[Skills]');
+  });
+  it.each(['toggle', 'remove', 'update', 'details', 'cancel'])('opens individual skill actions and reuses RPC for %s', async action => {
+    const h = harness([skillValue('one', 'sample'), action, ...(action === 'remove' ? [true] : []), undefined], [], true); await h.manager.open();
+    expect(vi.mocked(h.ui.dialog.select).mock.calls[1][0].title).toBe('Skill actions · Sample');
+    if (action === 'toggle') expect(h.rpc.setEnabled).toHaveBeenCalledWith({ sourceId: 'one', skillId: 'sample', enabled: false, options: { confirmOverride: false } });
+    if (action === 'remove') expect(h.rpc.remove).toHaveBeenCalledWith({ sourceId: 'one', skillId: 'sample' });
+    if (action === 'update') expect(h.rpc.update).toHaveBeenCalledWith({ sourceId: 'one', options: { confirmOverride: false } });
+    if (action === 'details') expect(h.ui.dialog.alert).toHaveBeenCalledWith(expect.objectContaining({ title: 'Installed skill', message: expect.stringContaining('Path: /cache/one/sample/SKILL.md') }));
+    if (action === 'cancel') { expect(h.rpc.setEnabled).not.toHaveBeenCalled(); expect(h.rpc.remove).not.toHaveBeenCalled(); }
+  });
+  it.each([false, undefined])('keeps individual skill removal safe on No/Esc (%s)', async answer => {
+    const h = harness([skillValue('one', 'sample'), 'remove', answer, undefined], [], true); await h.manager.open(); expect(h.rpc.remove).not.toHaveBeenCalled();
+  });
+  it('enables an abandoned disabled skill via Space without enabling its disabled source or offering updates', async () => {
+    const h = harness([(options: SelectOptions) => {
+      const action = options.actions!.find(a => a.bind === 'space')!;
+      if (action.selection !== 'none') action.onTrigger(skillValue('one', 'sample'));
+    }, skillValue('one', 'sample'), undefined, undefined], [], true);
+    h.state.installed[0].disabledSkills = ['sample']; h.state.installed[0].enabled = false; h.state.installed[0].abandoned = true; await h.manager.open();
+    expect(h.rpc.setEnabled).toHaveBeenCalledWith({ sourceId: 'one', skillId: 'sample', enabled: true, options: { confirmOverride: false } });
+    const menu = vi.mocked(h.ui.dialog.select).mock.calls.find(([o]) => o.title.startsWith('Skill actions'))![0];
+    expect(menu.options.map(o => o.value)).not.toContain('update'); expect(menu.options.map(o => o.value)).toContain('enable-source');
+  });
+  it('renders cached Installed sources badges before a slow check, dedupes Ctrl+R and repaints without reopening', async () => {
+    let finish!: (value?: string) => void;
+    let complete!: () => void;
+    const h = harness([footer('right'), () => new Promise(resolve => { finish = resolve; })]);
+    const checkedAt = new Date(Date.now() - 3 * 3600000).toISOString();
+    h.rpc.listUpdateStatus.mockResolvedValue({ checkedAt, updates: h.state.updates });
+    h.rpc.checkUpdates.mockImplementation(() => new Promise(resolve => { complete = () => resolve(h.state.updates); }));
+    h.ui.updateSelect = vi.fn();
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.ui.dialog.select).toHaveBeenCalledTimes(2));
+    const options = vi.mocked(h.ui.dialog.select).mock.calls[1][0];
+    expect(options.options[0].footer).toContain('[update available]');
+    expect(options.options[0].footer).toContain('checked 3h ago');
+    expect(h.ui.updateSelect).toHaveBeenCalledWith(expect.objectContaining({ hint: expect.stringContaining('checking…') }));
+    const refresh = options.actions!.find(a => a.bind === 'ctrl+r')!;
+    if (refresh.selection === 'none') { refresh.onTrigger(); refresh.onTrigger(); }
+    expect(h.rpc.checkUpdates).toHaveBeenCalledTimes(1);
+    h.rpc.listUpdateStatus.mockResolvedValue({ checkedAt: new Date().toISOString(), updates: [{ ...h.state.updates[0], updateAvailable: false }] });
+    complete();
+    await vi.waitFor(() => expect(h.ui.updateSelect).toHaveBeenLastCalledWith(expect.objectContaining({
+      hint: 'checked just now', options: [expect.objectContaining({ footer: expect.stringContaining('[up to date]') })],
+    })));
+    expect(h.ui.dialog.select).toHaveBeenCalledTimes(2);
+    finish(); await open;
+  });
+  it('uses fresh persisted status without checking until Ctrl+R forces an asynchronous check', async () => {
+    let finish!: () => void;
+    const h = harness([footer('right'), () => new Promise(resolve => { finish = () => resolve(undefined); })]);
+    h.rpc.listUpdateStatus.mockResolvedValue({ checkedAt: new Date().toISOString(), updates: h.state.updates });
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.ui.dialog.select).toHaveBeenCalledTimes(2));
+    expect(h.rpc.checkUpdates).not.toHaveBeenCalled();
+    const refresh = vi.mocked(h.ui.dialog.select).mock.calls[1][0].actions!.find(a => a.bind === 'ctrl+r')!;
+    if (refresh.selection === 'none') refresh.onTrigger();
+    expect(h.rpc.checkUpdates).toHaveBeenCalledTimes(1);
+    finish(); await open;
+  });
+  it.each(['dismiss', 'cleanup'])('ignores a slow check after %s closes the Installed sources dialog', async how => {
+    let finish!: () => void;
+    let complete!: () => void;
+    const h = harness([footer('right'), () => new Promise(resolve => { finish = () => resolve(undefined); })]);
+    h.rpc.checkUpdates.mockImplementation(() => new Promise(resolve => { complete = () => resolve(h.state.updates); }));
+    h.ui.updateSelect = vi.fn();
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.rpc.checkUpdates).toHaveBeenCalledTimes(1));
+    if (how === 'cleanup') h.manager.close();
+    finish(); await open;
+    const paints = vi.mocked(h.ui.updateSelect).mock.calls.length;
+    complete(); await new Promise(resolve => setTimeout(resolve, 10));
+    expect(h.ui.updateSelect).toHaveBeenCalledTimes(paints);
+    expect(h.ui.dialog.alert).not.toHaveBeenCalled();
+  });
+  it('keeps background failures quiet and displays a dim failure hint instead of a dialog', async () => {
+    let finish!: () => void;
+    const h = harness([footer('right'), () => new Promise(resolve => { finish = () => resolve(undefined); })]);
+    h.rpc.checkUpdates.mockRejectedValue(new Error('offline'));
+    h.ui.updateSelect = vi.fn();
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.ui.updateSelect).toHaveBeenCalledWith(expect.objectContaining({ hint: expect.stringContaining('check failed') })));
+    expect(h.ui.dialog.alert).not.toHaveBeenCalled();
+    expect(h.ui.toast.show).not.toHaveBeenCalled();
+    finish(); await open;
+  });
+  it('shows cached Discover rows while a catalog refresh is pending and updates them in place', async () => {
+    let finish!: () => void;
+    let complete!: () => void;
+    const h = harness([() => new Promise(resolve => { finish = () => resolve(undefined); })]);
+    h.rpc.refresh.mockImplementation(() => new Promise(resolve => { complete = () => resolve([]); }));
+    h.ui.updateSelect = vi.fn();
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.rpc.refresh).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(h.ui.dialog.select).mock.calls[0][0].options[0].title).toBe('Example kit');
+    h.state.available = [{ ...source, name: 'New catalog entry' }];
+    complete();
+    await vi.waitFor(() => expect(h.ui.updateSelect).toHaveBeenLastCalledWith(expect.objectContaining({ options: [expect.objectContaining({ title: 'New catalog entry' })] })));
+    expect(h.ui.dialog.select).toHaveBeenCalledTimes(1);
+    finish(); await open;
+  });
+  it('switches to cached Sources while the Discover refresh is still pending, without starting another fetch', async () => {
+    let finish!: () => void;
+    let complete!: () => void;
+    const h = harness([footer('right'), footer('right'), () => new Promise(resolve => { finish = () => resolve(undefined); })]);
+    h.rpc.refresh.mockImplementation(() => new Promise(resolve => { complete = () => resolve([]); }));
+    h.ui.updateSelect = vi.fn();
+    const open = h.manager.open();
+    await vi.waitFor(() => expect(h.ui.dialog.select).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(h.ui.dialog.select).mock.calls[2][0].options[0].title).toBe('Example marketplace');
+    expect(h.rpc.refresh).toHaveBeenCalledTimes(1);
+    h.state.sources = [{ ...source, name: 'Refreshed source' }];
+    complete();
+    await vi.waitFor(() => expect(h.ui.updateSelect).toHaveBeenLastCalledWith(expect.objectContaining({ title: expect.stringContaining('[Sources]'), hint: '', options: [expect.objectContaining({ title: 'Refreshed source' })] })));
+    expect(vi.mocked(h.ui.updateSelect).mock.calls.filter(([update]) => update.options.some(r => r.title === 'Refreshed source')).every(([update]) => update.title.includes('[Sources]'))).toBe(true);
+    finish(); await open;
+  });
+  it('previews exact skills/source before installing and toasts success', async () => {
+    const h = harness(['one', true, undefined]);
+    await h.manager.open();
+    expect(h.rpc.listAvailable).toHaveBeenCalledWith({ sourceId: 'one' });
+    expect(h.ui.confirmation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ title: 'Install skill? · Example kit', yes: 'Yes, install', message: expect.stringContaining('Skills: sample, audit (2)') }));
+    expect(h.ui.dialog.alert).not.toHaveBeenCalled();
+    expect(h.rpc.install).toHaveBeenCalledWith({ sourceId: 'one', options: { confirmOverride: false, exclude: [] } });
+    expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ message: 'Installed 1 skill(s); sessions on this server refresh next model step', variant: 'success' }));
+  });
+  it('does not install on No or without discovered skills', async () => {
+    const no = harness(['one', false, undefined]); await no.manager.open(); expect(no.rpc.install).not.toHaveBeenCalled();
+    const empty = harness(['one', true, undefined]); empty.state.available[0] = { ...source, skills: [] };
+    await empty.manager.open(); expect(empty.rpc.install).not.toHaveBeenCalled();
+  });
+  it('passes checklist exclusions to installation and preserves them on collision retry', async () => {
+    const h = harness(['one', true, undefined]);
+    h.ui.installPreview = vi.fn(async () => ['audit']);
+    h.rpc.install.mockRejectedValueOnce({ type: 'collision', message: 'collision', data: { id: 'sample', origin: '/external', canOverride: true } });
+    await h.manager.open();
+    expect(h.ui.installPreview).toHaveBeenCalledWith(expect.objectContaining({ entry: source }));
+    expect(h.rpc.install).toHaveBeenNthCalledWith(1, { sourceId: 'one', options: { confirmOverride: false, exclude: ['audit'] } });
+    expect(h.rpc.install).toHaveBeenNthCalledWith(2, { sourceId: 'one', options: { confirmOverride: true, exclude: ['audit'] } });
+  });
+  it('refuses an empty selection returned by another UI adapter', async () => {
+    const h = harness(['one', undefined]); h.ui.installPreview = vi.fn(async () => ['sample', 'audit']); await h.manager.open();
+    expect(h.rpc.install).not.toHaveBeenCalled(); expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ message: 'Select at least one skill' }));
+  });
+  it.each(['toggle', 'update', 'remove'])('supports Installed sources action %s', async action => {
+    const h = harness([footer('right'), 'one', action, ...(action === 'remove' ? [true] : []), undefined]);
+    await h.manager.open();
+    expect(h.rpc.checkUpdates).toHaveBeenCalledTimes(1);
+    if (action === 'toggle') expect(h.rpc.setEnabled).toHaveBeenCalledWith({ sourceId: 'one', enabled: false, options: { confirmOverride: false } });
+    if (action === 'update') expect(h.rpc.update).toHaveBeenCalledWith({ sourceId: 'one', options: { confirmOverride: false } });
+    if (action === 'remove') expect(h.rpc.remove).toHaveBeenCalledWith({ sourceId: 'one' });
+    expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ message: `${action === 'toggle' ? 'Source disabled' : action === 'update' ? 'Source updated' : 'Source removed'}; sessions on this server refresh next model step`, variant: 'success' }));
+  });
+  it('explains refresh timing when enabling a disabled source', async () => {
+    const h = harness([footer('right'), 'one', 'toggle', undefined]);
+    h.state.installed[0].enabled = false;
+    h.rpc.setEnabled.mockResolvedValue({ ...h.state.installed[0], enabled: true });
+    await h.manager.open();
+    expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ message: 'Source enabled; sessions on this server refresh next model step', variant: 'success' }));
+  });
+  it('switches tabs, shows Errors and clears only with confirmation', async () => {
+    const h = harness([footer('left'), footer('left'), 'error', footer('ctrl+x'), true, undefined]);
+    await h.manager.open();
+    expect(h.rpc.listErrors).toHaveBeenCalled();
+    expect(h.ui.dialog.alert).toHaveBeenCalledWith(expect.objectContaining({ title: 'unsupported-component', message: expect.stringContaining('Commands not supported') }));
+    expect(h.rpc.clearErrors).toHaveBeenCalledTimes(1);
+  });
+  it('adds a public marketplace and refreshes it without installing', async () => {
+    const h = harness([footer('ctrl+a'), 'marketplace', undefined], ['https://host/path/marketplace.json', '']);
+    await h.manager.open();
+    expect(h.rpc.addSource).toHaveBeenCalledWith({ input: 'https://host/path/marketplace.json', options: {} });
+    expect(h.rpc.refresh).toHaveBeenCalled();
+    expect(h.rpc.install).not.toHaveBeenCalled();
+  });
+  it.each(['bearer', 'header', 'query'])('adds auth by env-var reference only (%s)', async mode => {
+    const prompts = ['https://example.test/skill.md', 'SKILLZ_TOKEN', ...(mode === 'bearer' ? [] : ['X-Api-Key'])];
+    const h = harness([footer('ctrl+a'), 'direct', mode, undefined], prompts);
+    await h.manager.open();
+    expect(h.rpc.addSource).toHaveBeenCalledWith({ input: 'https://example.test/skill.md', options: { auth: mode === 'bearer'
+      ? { authEnv: 'SKILLZ_TOKEN', prefix: 'Bearer ' } : mode === 'header' ? { authEnv: 'SKILLZ_TOKEN', header: 'X-Api-Key', prefix: '' } : { authEnv: 'SKILLZ_TOKEN', query: 'X-Api-Key' } } });
+  });
+  it('rejects invalid env names and reports disconnected-server errors without retry loops', async () => {
+    const h = harness([footer('ctrl+a'), 'direct'], ['https://example.test/skill.md', 'not a name']);
+    await h.manager.open(); expect(h.rpc.addSource).not.toHaveBeenCalled();
+    expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ variant: 'error' }));
+    const offline = harness(); offline.rpc.listSources.mockRejectedValue(new Error('offline')); await offline.manager.open();
+    expect(offline.rpc.listSources).toHaveBeenCalledTimes(1);
+    expect(offline.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ message: 'offline', variant: 'error' }));
+  });
+  it.each(['remove', 'keep', undefined])('previews exact marketplace origins and makes explicit choice %s', async choice => {
+    const h = harness([footer('right'), footer('right'), 'catalog', 'remove', choice, undefined]);
+    await h.manager.open();
+    expect(h.rpc.previewRemoveSource).toHaveBeenCalledWith({ sourceId: 'catalog' });
+    expect(h.ui.removalChoice).toHaveBeenCalledWith(expect.objectContaining({ count: 1, message: expect.stringContaining('one / sample') }));
+    expect(h.ui.confirmation).not.toHaveBeenCalled();
+    if (choice) expect(h.rpc.removeSource).toHaveBeenCalledWith({ sourceId: 'catalog', skills: choice, revision: 'preview' });
+    else expect(h.rpc.removeSource).not.toHaveBeenCalled();
+  });
+  it('uses a simple safe confirmation for a source with no installed skills', async () => {
+    const h = harness([footer('right'), footer('right'), 'catalog', 'remove', true, undefined]);
+    h.state.installed = [];
+    await h.manager.open();
+    expect(h.ui.removalChoice).not.toHaveBeenCalled();
+    expect(h.ui.confirmation).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('Installed skills: 0') }));
+    expect(h.rpc.removeSource).toHaveBeenCalledWith({ sourceId: 'catalog', skills: 'remove', revision: 'preview' });
+  });
+  it('shows abandoned badge and dim source-removed hint without update action', async () => {
+    const h = harness([footer('right'), 'one', undefined]);
+    h.state.installed[0].abandoned = true;
+    expect(rowsFor('Installed sources', h.state)[0].footer).toContain('[abandoned]');
+    expect(rowsFor('Installed sources', h.state)[0].footer).toContain('source removed');
+    expect(badges(h.state.installed[0], h.state.updates[0])).not.toContain('update available');
+    await h.manager.open();
+    const actions = vi.mocked(h.ui.dialog.select).mock.calls.find(([o]) => o.title === 'Source actions')![0];
+    expect(actions.options.map(o => o.value)).not.toContain('update');
+  });
+  it.each(['remove-skill', 'toggle-skill'])('targets an individual abandoned skill with %s', async action => {
+    const h = harness([footer('right'), 'one', action, 'sample', ...(action === 'remove-skill' ? [true] : []), undefined]);
+    h.state.installed[0].abandoned = true;
+    h.state.installed[0].skills.push({ ...h.state.installed[0].skills[0], id: 'audit' });
+    await h.manager.open();
+    if (action === 'remove-skill') expect(h.rpc.remove).toHaveBeenCalledWith({ sourceId: 'one', skillId: 'sample' });
+    else expect(h.rpc.setEnabled).toHaveBeenCalledWith({ sourceId: 'one', skillId: 'sample', enabled: false, options: { confirmOverride: false } });
+    expect(h.rpc.removeSource).not.toHaveBeenCalled();
+  });
+});
+
+describe('TUI plugin load smoke', () => {
+  function inventoryContext() {
+    const h = harness();
+    const location = { directory: '/isolated/home' };
+    const skill = { invalidate: vi.fn(), sync: vi.fn(async () => {}) };
+    const rpcFactory = vi.fn(() => h.rpc);
+    const ctx = { ui: h.ui, client: { rpc: rpcFactory }, data: { location: { default: () => location, skill } } } as unknown as Plugin.Context;
+    return { ...h, location, skill, rpcFactory, ctx };
+  }
+  it.each(['install', 'update', 'remove', 'setEnabled', 'removeSource', 'addSource', 'refresh'] as const)('refreshes native inventory only after successful %s response', async method => {
+    const h = inventoryContext();
+    let resolve!: (value: unknown) => void;
+    h.rpc[method].mockImplementationOnce(() => new Promise(done => { resolve = done; }) as never);
+    const rpc = createRpc(h.ctx);
+    const input = method === 'refresh' ? undefined : method === 'addSource' ? { input: '/source' } : { sourceId: 'one', enabled: true, skills: 'remove' as const };
+    const pending = (rpc[method] as (input: unknown) => Promise<unknown>)(input);
+    expect(h.skill.invalidate).not.toHaveBeenCalled();
+    expect(h.rpc[method]).toHaveBeenCalledWith(input, { location: h.location });
+    const result = { saved: true }; resolve(result);
+    expect(await pending).toBe(result);
+    expect(h.skill.invalidate).toHaveBeenCalledExactlyOnceWith(h.location);
+    expect(h.skill.sync).toHaveBeenCalledExactlyOnceWith(h.location);
+    expect(h.skill.invalidate.mock.invocationCallOrder[0]).toBeLessThan(h.skill.sync.mock.invocationCallOrder[0]!);
+  });
+  it.each(['toggle', 'remove'])('invalidates and syncs native inventory after Skills-tab %s', async action => {
+    const h = inventoryContext();
+    const steps = [skillValue('one', 'sample'), action, undefined];
+    h.ui.dialog.select = vi.fn(async () => steps.shift()) as UI['dialog']['select'];
+    h.ui.confirmation = vi.fn(async () => true);
+    await new SkillzManager(createRpc(h.ctx), h.ui).open();
+    expect(h.skill.invalidate).toHaveBeenCalledWith(h.location); expect(h.skill.sync).toHaveBeenCalledWith(h.location);
+    expect(action === 'remove' ? h.rpc.remove : h.rpc.setEnabled).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceId: 'one', skillId: 'sample' }), { location: h.location });
+  });
+  it('does not refresh on failed mutations or read-only operations', async () => {
+    const h = inventoryContext(); const rpc = createRpc(h.ctx);
+    h.rpc.install.mockRejectedValueOnce(new Error('collision'));
+    await expect(rpc.install({ sourceId: 'one' })).rejects.toThrow('collision');
+    await rpc.listAvailable(); await rpc.listInstalled(); await rpc.checkUpdates();
+    expect(h.skill.invalidate).not.toHaveBeenCalled(); expect(h.skill.sync).not.toHaveBeenCalled();
+  });
+  it('captures the mutation location and reads the current client on each call', async () => {
+    const h = inventoryContext(); const rpc = createRpc(h.ctx);
+    const location = { directory: '/session/location' };
+    Object.assign(h.ctx, { location });
+    h.rpc.install.mockImplementationOnce(async () => {
+      Object.assign(h.ctx, { location: { directory: '/different/location' } });
+      return h.state.installed[0];
+    });
+    await rpc.install({ sourceId: 'one' });
+    expect(h.skill.sync).toHaveBeenCalledWith(location);
+    const next = harness(); Object.assign(h.ctx, { client: { rpc: () => next.rpc } });
+    await rpc.remove({ sourceId: 'one' });
+    expect(next.rpc.remove).toHaveBeenCalledWith({ sourceId: 'one' }, { location: { directory: '/different/location' } });
+  });
+  it('keeps a committed mutation successful when inventory sync fails', async () => {
+    const h = inventoryContext(); const rpc = createRpc(h.ctx);
+    h.skill.sync.mockRejectedValueOnce(new Error('offline'));
+    await expect(rpc.install({ sourceId: 'one' })).resolves.toBe(h.state.installed[0]);
+    expect(h.ui.toast.show).toHaveBeenCalledWith(expect.objectContaining({ variant: 'warning', message: expect.stringContaining('Change saved') }));
+  });
+  it('does not touch disposed plugin UI or data after an in-flight RPC completes', async () => {
+    const h = inventoryContext(); let active = true;
+    const rpc = createRpc(h.ctx, () => active);
+    h.rpc.install.mockImplementationOnce(async () => { active = false; return h.state.installed[0]; });
+    await rpc.install({ sourceId: 'one' });
+    expect(h.skill.sync).not.toHaveBeenCalled(); expect(h.skill.invalidate).not.toHaveBeenCalled();
+    expect(h.ui.toast.show).not.toHaveBeenCalled();
+  });
+  it('loads the real plugin definition, registers /skillz globally and scopes typed RPC calls on home', async () => {
+    const h = harness();
+    let layer!: ReturnType<Parameters<Plugin.Context['keymap']['layer']>[0]>;
+    const location = { directory: '/isolated/home' };
+    const rpcFactory = vi.fn(() => h.rpc);
+    const ctx = { ui: h.ui, client: { rpc: rpcFactory }, data: { location: { default: () => location, skill: { invalidate: vi.fn(), sync: vi.fn(async () => {}) } } },
+      keymap: { layer: (factory: () => typeof layer) => { layer = factory(); } } } as unknown as Plugin.Context;
+    expect(plugin.id).toBe('skillz.tui');
+    expect(plugin.setup).toBe(setup);
+    const cleanup = setup(ctx);
+    expect(layer.mode).toBe('global');
+    expect(layer.commands?.map(c => c.slash?.name)).toEqual(['skillz']);
+    await layer.commands![0].run();
+    expect(rpcFactory).toHaveBeenCalledWith(SkillzRpc);
+    expect(h.rpc.listSources).toHaveBeenCalledWith(undefined, { location });
+    expect(h.rpc.listSources).toHaveBeenCalledTimes(1);
+    cleanup();
+    await layer.commands![0].run();
+    expect(h.rpc.listSources).toHaveBeenCalledTimes(1);
+  });
+});
