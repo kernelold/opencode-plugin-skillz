@@ -8,6 +8,29 @@ Core, registration, TUI and scheduling/hardening are implemented. This README do
 
 Requires npm, Node.js **>=26.4.0** (required by the OpenTUI dependency `@opentui/core` 0.5.14), and OpenCode **2.0.24**. Older Node versions fail the `engines` check. Git installs and git skill sources also require git and your existing SSH/credential-helper setup. The plugin API dependency is pinned to 2.0.24; newer CLI APIs are not assumed compatible.
 
+### From npm (pnpm)
+
+```sh
+opencode plugin add opencode-plugin-skillz
+opencode plugin list
+```
+
+`opencode plugin add` installs the package and records it under `plugins` in your OpenCode configuration. Restart OpenCode afterwards, then type `/skillz`.
+
+To install the package into a project with pnpm instead:
+
+```sh
+pnpm add opencode-plugin-skillz
+```
+
+and reference it by name in `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "plugins": ["opencode-plugin-skillz"],
+}
+```
+
 ### From git
 
 ```sh
